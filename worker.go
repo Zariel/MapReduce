@@ -51,56 +51,80 @@ type FileSystem interface {
 	Open(path string) (io.ReadWriteCloser, error)
 }
 
-type RecordReader interface {
-	ReadRecord() (key, value []byte, err error)
+type RecordScanner interface {
+	Scan() bool
+	Pair() (key, value []byte)
+	Err() error
 }
 
 type InputFormat interface {
-	Reader(r io.Reader) (RecordReader, error)
+	Records(r io.Reader) (RecordScanner, error)
 }
 
 type TextInputFormat struct{}
 
-func (*TextInputFormat) Reader(r io.Reader) (RecordReader, error) {
+func (*TextInputFormat) Records(r io.Reader) (RecordScanner, error) {
 	return &lineTextRecordReader{
 		s: bufio.NewScanner(r),
 	}, nil
 }
 
 type lineTextRecordReader struct {
-	s *bufio.Scanner
+	s    *bufio.Scanner
+	k, v []byte // next
+	err  error
 }
 
-func (l *lineTextRecordReader) ReadRecord() (k, v []byte, err error) {
+func (l *lineTextRecordReader) Pair() ([]byte, []byte) {
+	return l.k, l.v
+}
+
+func (l *lineTextRecordReader) next() bool {
+	// reads a single KV pair
 	if !l.s.Scan() {
-		if err = l.s.Err(); err != nil {
-			return
+		if err := l.s.Err(); err != nil {
+			l.err = err
+			return false
 		}
-		err = io.EOF
-		return
+
+		return false
 	}
 
+	return true
+}
+
+func (l *lineTextRecordReader) Scan() bool {
+	if !l.next() {
+		return false
+	}
+
+	// TOOD: reuse l.k and l.v if there is cap
 	buf := l.s.Bytes()
-	k = make([]byte, len(buf))
+	k := make([]byte, len(buf))
 	copy(k, buf)
 
-	if !l.s.Scan() {
-		if err = l.s.Err(); err != nil {
-			return
-		}
-		err = io.EOF
-		return
+	if !l.next() {
+		l.err = io.EOF
+		return false
 	}
 
 	buf = l.s.Bytes()
-	v = make([]byte, len(buf))
+	v := make([]byte, len(buf))
 	copy(v, buf)
 
-	if err = l.s.Err(); err != nil {
-		return
+	if err := l.s.Err(); err != nil {
+		l.err = err
+		return false
 	}
 
-	return
+	l.k = k
+	l.v = v
+
+	return true
+}
+
+func (l *lineTextRecordReader) Err() error {
+	return l.err
 }
 
 type mapWorker struct {
@@ -110,25 +134,6 @@ type mapWorker struct {
 	fs          FileSystem
 
 	inputFormat InputFormat
-	records     RecordReader
-}
-
-// assigns the worker to run over some input data
-// this will come via RPC from the master
-func (m *mapWorker) assignSplit(path string, offset, size int64) error {
-	r, err := m.fs.OpenSectionReader(path, offset, size)
-	if err != nil {
-		return nil
-	}
-
-	split, err := m.inputFormat.Reader(r)
-	if err != nil {
-		return err
-	}
-
-	m.records = split
-
-	return nil
 }
 
 type outputCollector struct {
@@ -168,14 +173,13 @@ type localOutputCollector struct {
 }
 
 type mapResult struct {
-	key, value []byte
+	K, V []byte
 }
 
 func tempFile(name string) (io.WriteCloser, error) {
 	// TODO: need to have something which can map the parition(key) -> file so that
 	// reduce tasks can read them.
 	path := filepath.Join(*tempDir, name)
-	log.Printf("name=%q path=%q\n", name, path)
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
 		return nil, err
@@ -205,27 +209,45 @@ func (l *localOutputCollector) Emit(key, value []byte) error {
 		l.outputs[pkey] = output
 	}
 
-	output.bw.Write(key)
-	output.bw.Write(value)
-	// // how to store the intermediate data? For now just GOB
-	// if err := output.gw.Encode(mapResult{key, value}); err != nil {
-	// 	return err
-	// }
+	// how to store the intermediate data? For now just GOB
+	if err := output.gw.Encode(mapResult{key, value}); err != nil {
+		return err
+	}
 
 	return nil
 }
 
-func (m *mapWorker) run() error {
+func (m *mapWorker) getSplit(path string, offset, size int64) (RecordScanner, error) {
+	r, err := m.fs.OpenSectionReader(path, offset, size)
+	if err != nil {
+		return nil, err
+	}
+
+	split, err := m.inputFormat.Records(r)
+	if err != nil {
+		return nil, err
+	}
+
+	return split, nil
+}
+
+// assigns the worker to run over some input data
+// this will come via RPC from the master
+func (m *mapWorker) Run(path string, offset, size int64) error {
+	records, err := m.getSplit(path, offset, size)
+	if err != nil {
+		return err
+	}
+
 	// TODO: cleanup on failure
-	// How to split intermediate map output?
 	collector := &localOutputCollector{
 		partitioner: m.partitioner,
 		outputs:     make(map[string]*outputCollector),
 	}
 
 	// TODO: collect stats
-	for {
-		key, value, err := m.records.ReadRecord()
+	for records.Scan() {
+		key, value := records.Pair()
 		if err != nil {
 			if err == io.EOF {
 				// end of input
@@ -236,6 +258,11 @@ func (m *mapWorker) run() error {
 		if err := m.mapper.Map(collector, key, value); err != nil {
 			return err
 		}
+	}
+
+	// TOOD: skip buggy rows?
+	if err := records.Err(); err != nil {
+		return err
 	}
 
 	// final error

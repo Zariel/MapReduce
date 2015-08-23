@@ -93,11 +93,7 @@ func (mr *MapReduce) startMaster(addr string) error {
 			return err
 		}
 
-		if err := mapper.assignSplit(p, 0, size); err != nil {
-			return err
-		}
-
-		if err := mapper.run(); err != nil {
+		if err := mapper.Run(p, 0, size); err != nil {
 			return err
 		}
 	}
