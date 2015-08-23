@@ -265,8 +265,12 @@ func (rw *reduceWorker) runReduce(output io.Writer, input io.Reader) error {
 		// TODO: do we need to copy this?
 		key := kv.K
 
-		ch := make(chan []byte, 2)
-		ch <- kv.V
+		ch := make(chan []byte, 3)
+		// TODO: avoid this copy
+		buf := make([]byte, len(kv.V))
+		copy(buf, kv.V)
+		ch <- buf
+
 		go func() {
 			defer close(ch)
 			// TODO: how to handle errors from iterating here?
@@ -284,7 +288,11 @@ func (rw *reduceWorker) runReduce(output io.Writer, input io.Reader) error {
 					return
 				}
 
-				ch <- last.V
+				// TODO: avoid this copy
+				buf := make([]byte, len(last.V))
+				copy(buf, last.V)
+
+				ch <- buf
 			}
 
 			*kv = *last
