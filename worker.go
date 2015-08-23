@@ -84,7 +84,6 @@ func (l *lineTextRecordReader) next() bool {
 	if !l.s.Scan() {
 		if err := l.s.Err(); err != nil {
 			l.err = err
-			return false
 		}
 
 		return false
@@ -98,27 +97,16 @@ func (l *lineTextRecordReader) Scan() bool {
 		return false
 	}
 
-	// TOOD: reuse l.k and l.v if there is cap
 	buf := l.s.Bytes()
 	k := make([]byte, len(buf))
 	copy(k, buf)
-
-	if !l.next() {
-		l.err = io.EOF
-		return false
-	}
-
-	buf = l.s.Bytes()
-	v := make([]byte, len(buf))
-	copy(v, buf)
 
 	if err := l.s.Err(); err != nil {
 		l.err = err
 		return false
 	}
 
-	l.k = k
-	l.v = v
+	l.v = k
 
 	return true
 }
