@@ -2,6 +2,7 @@ package mapreduce
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/sha512"
 	"encoding/gob"
 	"encoding/hex"
@@ -14,15 +15,15 @@ import (
 
 type localFileSystem struct{}
 
-type sectionReadCloser struct {
-	io.Reader
-	io.Closer
-}
-
 func (l *localFileSystem) OpenSectionReader(path string, offset int64, size int64) (io.ReadCloser, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
+	}
+
+	type sectionReadCloser struct {
+		io.Reader
+		io.Closer
 	}
 
 	return &sectionReadCloser{
@@ -125,19 +126,25 @@ type mapWorker struct {
 }
 
 type outputCollector struct {
-	w  io.WriteCloser
-	bw *bufio.Writer
-	gw *gob.Encoder
+	path string
+	w    io.WriteCloser
+	bw   *bufio.Writer
+	gw   *gob.Encoder
 
 	partition string
 }
 
 type Partitioner interface {
 	Partition(key []byte) []byte
+	N() int
 }
 
 type hashPartitioner struct {
 	npartitions int64
+}
+
+func (h *hashPartitioner) N() int {
+	return int(h.npartitions)
 }
 
 func (h *hashPartitioner) Partition(key []byte) []byte {
@@ -164,23 +171,48 @@ type mapResult struct {
 	K, V []byte
 }
 
-func tempFile(name string) (io.WriteCloser, error) {
+type mapResultList []*mapResult
+
+func (m mapResultList) Less(i, j int) bool {
+	switch bytes.Compare(m[i].K, m[j].K) {
+	case -1:
+		return true
+	case 0:
+		if bytes.Compare(m[i].V, m[j].V) == -1 {
+			return true
+		}
+
+		return false
+	default:
+		return false
+	}
+}
+
+func (m mapResultList) Swap(i, j int) {
+	m[i], m[j] = m[j], m[i]
+}
+
+func (m mapResultList) Len() int {
+	return len(m)
+}
+
+func tempFile(name string) (io.WriteCloser, string, error) {
 	// TODO: need to have something which can map the parition(key) -> file so that
 	// reduce tasks can read them.
 	path := filepath.Join(*tempDir, name)
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
-	return f, nil
+	return f, path, nil
 }
 
 func (l *localOutputCollector) Emit(key, value []byte) error {
 	pkey := hex.EncodeToString(l.partitioner.Partition(key))
 	output, ok := l.outputs[pkey]
 	if !ok {
-		w, err := tempFile(pkey)
+		w, path, err := tempFile(pkey)
 		if err != nil {
 			// TODO: indicate where this came from?
 			return err
@@ -188,6 +220,7 @@ func (l *localOutputCollector) Emit(key, value []byte) error {
 
 		bw := bufio.NewWriter(w)
 		output = &outputCollector{
+			path:      path,
 			w:         w,
 			bw:        bw,
 			gw:        gob.NewEncoder(bw),
@@ -219,12 +252,16 @@ func (m *mapWorker) getSplit(path string, offset, size int64) (RecordScanner, er
 	return split, nil
 }
 
+type mapResultResponse struct {
+	Files map[string]string
+}
+
 // assigns the worker to run over some input data
 // this will come via RPC from the master
-func (m *mapWorker) Run(path string, offset, size int64) error {
+func (m *mapWorker) Run(path string, offset, size int64) (*mapResultResponse, error) {
 	records, err := m.getSplit(path, offset, size)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// TODO: cleanup on failure
@@ -236,21 +273,15 @@ func (m *mapWorker) Run(path string, offset, size int64) error {
 	// TODO: collect stats
 	for records.Scan() {
 		key, value := records.Pair()
-		if err != nil {
-			if err == io.EOF {
-				// end of input
-				break
-			}
-		}
 
 		if err := m.mapper.Map(collector, key, value); err != nil {
-			return err
+			return nil, err
 		}
 	}
 
 	// TOOD: skip buggy rows?
 	if err := records.Err(); err != nil {
-		return err
+		return nil, err
 	}
 
 	// final error
@@ -275,5 +306,17 @@ func (m *mapWorker) Run(path string, offset, size int64) error {
 		}
 	}
 
-	return ferr
+	if ferr != nil {
+		return nil, ferr
+	}
+
+	result := &mapResultResponse{
+		Files: make(map[string]string, m.partitioner.N()),
+	}
+
+	for _, v := range collector.outputs {
+		result.Files[v.partition] = v.path
+	}
+
+	return result, nil
 }

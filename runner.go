@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 )
 
 var mesosDir string
@@ -54,7 +55,13 @@ func (mr *MapReduce) Run() error {
 		mr.Partitioner = &hashPartitioner{4}
 	}
 
-	if err := os.MkdirAll(*tempDir, 0700); err != nil {
+	err := os.MkdirAll(*tempDir, 0700)
+	if err != nil {
+		return err
+	}
+
+	*tempDir, err = filepath.Abs(*tempDir)
+	if err != nil {
 		return err
 	}
 
@@ -86,6 +93,8 @@ func (mr *MapReduce) startMaster(addr string) error {
 		inputFormat: &TextInputFormat{}, // TODO pass this in
 	}
 
+	partitions := make(map[string][]string)
+
 	// setup splits
 	for _, p := range mr.Input {
 		size, err := mr.FileSystem.Size(p)
@@ -93,8 +102,38 @@ func (mr *MapReduce) startMaster(addr string) error {
 			return err
 		}
 
-		if err := mapper.Run(p, 0, size); err != nil {
+		// TODO: retry
+		result, err := mapper.Run(p, 0, size)
+		if err != nil {
 			return err
+		}
+
+		for partition, path := range result.Files {
+			partitions[partition] = append(partitions[partition], path)
+		}
+	}
+
+	// We will have R partitions at this point, we can lazilly load and sort after
+	// each partition part is finished by a map task (shuffle phase) when loading
+	// onto the reducers local disks.
+	// For now we just need 1 reducer per partion to run
+	for partition, paths := range partitions {
+		reducer := &reduceWorker{
+			fs:        mr.FileSystem,
+			partition: partition,
+		}
+
+		for _, path := range paths {
+			if err := reducer.loadData(path); err != nil {
+				// THis error could indicate that the mapper failed, that the data
+				// could not fit into memory or various other things.
+				// TODO: Properly handle all cases for this error
+				return err
+			}
+		}
+
+		if err := reducer.Run(); err != nil {
+			return fmt.Errorf("reduce failed for partition %q: %v\n", partition, err)
 		}
 	}
 
