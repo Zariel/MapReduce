@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/binary"
+	"fmt"
+	"io"
 	"log"
 	"strings"
 
@@ -10,6 +12,21 @@ import (
 
 func init() {
 	log.SetFlags(log.Lshortfile | log.LstdFlags)
+}
+
+type stringCountOF struct{}
+
+func (*stringCountOF) RecordWriter(w io.Writer) mapreduce.RecordWriter {
+	return &stringCountW{w}
+}
+
+type stringCountW struct {
+	w io.Writer
+}
+
+func (sc *stringCountW) WriteRecord(k, v []byte) error {
+	_, err := fmt.Fprintf(sc.w, "%s,%d\n", k, binary.BigEndian.Uint64(v))
+	return err
 }
 
 type wordCount struct{}
@@ -43,6 +60,8 @@ func (*wordCount) Reduce(key []byte, values <-chan []byte) []byte {
 func main() {
 	wc := &wordCount{}
 	mr := mapreduce.New(wc, wc, "testdata/data.txt")
+	mr.OutputFormat = &stringCountOF{}
+	mr.OutputPath = "out/"
 
 	if err := mr.Run(); err != nil {
 		log.Fatal(err)

@@ -17,6 +17,10 @@ import (
 type reduceWorker struct {
 	reducer Reducer
 
+	workerID     int
+	outputPath   string
+	outputFormat OutputFormat
+
 	fs        FileSystem
 	partition string
 	fileCount uint64
@@ -208,17 +212,46 @@ func (rw *reduceWorker) sortAndLoad() (io.ReadCloser, error) {
 	return f, nil
 }
 
-func (rw *reduceWorker) Run() error {
+func (rw *reduceWorker) Run() (err error) {
 	f, err := rw.sortAndLoad()
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 
+	output, err := rw.fs.Open(rw.outputPath)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		cerr := output.Close()
+		if cerr != nil && err == nil {
+			err = cerr
+		}
+	}()
+
+	// TODO: have this controlled by the FileSystem
+	bw := bufio.NewWriter(output)
+
+	if err = rw.runReduce(output, f); err != nil {
+		return
+	}
+
+	if err = bw.Flush(); err != nil {
+		return
+	}
+
+	return nil
+}
+
+func (rw *reduceWorker) runReduce(output io.Writer, input io.Reader) error {
+
 	last := &mapResult{}
 	kv := &mapResult{}
 
-	dec := gob.NewDecoder(bufio.NewReader(f))
+	recordWriter := rw.outputFormat.RecordWriter(output)
+
+	dec := gob.NewDecoder(bufio.NewReader(input))
 	for {
 		err := dec.Decode(kv)
 		if err != nil {
@@ -228,6 +261,9 @@ func (rw *reduceWorker) Run() error {
 
 			return err
 		}
+
+		// TODO: do we need to copy this?
+		key := kv.K
 
 		ch := make(chan []byte, 2)
 		ch <- kv.V
@@ -250,11 +286,24 @@ func (rw *reduceWorker) Run() error {
 
 				ch <- last.V
 			}
+
+			*kv = *last
 		}()
 
-		res := rw.reducer.Reduce(kv.K, ch)
-		kv.V = res
+		res := rw.reducer.Reduce(key, ch)
+
+		if err := recordWriter.WriteRecord(key, res); err != nil {
+			return err
+		}
 	}
 
 	return nil
+}
+
+type RecordWriter interface {
+	WriteRecord(key, value []byte) error
+}
+
+type OutputFormat interface {
+	RecordWriter(w io.Writer) RecordWriter
 }

@@ -3,12 +3,13 @@ package mapreduce
 import (
 	"bufio"
 	"bytes"
-	"crypto/sha512"
+	"encoding/binary"
 	"encoding/gob"
 	"encoding/hex"
+	"fmt"
+	"hash/fnv"
 	"io"
 	"log"
-	"math/big"
 	"os"
 	"path/filepath"
 )
@@ -16,7 +17,7 @@ import (
 type localFileSystem struct{}
 
 func (l *localFileSystem) OpenSectionReader(path string, offset int64, size int64) (io.ReadCloser, error) {
-	f, err := os.Open(path)
+	f, err := os.OpenFile(path, os.O_RDONLY|os.O_CREATE, 0600)
 	if err != nil {
 		return nil, err
 	}
@@ -42,7 +43,11 @@ func (l *localFileSystem) Size(path string) (int64, error) {
 }
 
 func (l *localFileSystem) Open(path string) (io.ReadWriteCloser, error) {
-	return os.Open(path)
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return nil, err
+	}
+
+	return os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0600)
 }
 
 // this is for reading, can we unify one for writing?
@@ -140,7 +145,7 @@ type Partitioner interface {
 }
 
 type hashPartitioner struct {
-	npartitions int64
+	npartitions uint64
 }
 
 func (h *hashPartitioner) N() int {
@@ -148,17 +153,19 @@ func (h *hashPartitioner) N() int {
 }
 
 func (h *hashPartitioner) Partition(key []byte) []byte {
-	hash := sha512.Sum512(key)
-
-	bint := big.NewInt(0)
-	bint = bint.SetBytes(hash[:])
-	bint = bint.Mod(bint, big.NewInt(h.npartitions))
-
-	if bint.BitLen() == 0 {
-		return []byte{0}
+	// TODO: use fnv or murmur or something to avoid so many bytes which requires
+	// doing big math, we also dont need a crypto hash.
+	hash := fnv.New64()
+	_, err := hash.Write(key)
+	if err != nil {
+		panic(err)
 	}
 
-	return bint.Bytes()
+	p := hash.Sum64() % h.npartitions
+	buf := make([]byte, 8)
+	binary.BigEndian.PutUint64(buf, p)
+
+	return buf
 }
 
 type localOutputCollector struct {
@@ -169,6 +176,10 @@ type localOutputCollector struct {
 
 type mapResult struct {
 	K, V []byte
+}
+
+func (mr *mapResult) String() string {
+	return fmt.Sprintf("key=%q value=%q", mr.K, mr.V)
 }
 
 type mapResultList []*mapResult

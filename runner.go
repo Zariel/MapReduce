@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path"
 	"path/filepath"
 )
 
@@ -41,19 +42,34 @@ type MapReduce struct {
 	Reducer Reducer
 	Input   []string
 
-	Partitioner    Partitioner
+	Partitioner  Partitioner
+	FileSystem   FileSystem
+	OutputFormat OutputFormat
+	// Is it better to specify the number of mappers or the size of blocks to read
+	// per mapper? Google paper specifies number of mappers M and number of reducers
+	// R
 	InputBlockSize int64
-	FileSystem     FileSystem
+	NumberReducers uint64
+	OutputPath     string
 }
 
 func (mr *MapReduce) Run() error {
 	flag.Parse()
 
+	if mr.NumberReducers == 0 {
+		mr.NumberReducers = 4
+	}
+
 	if mr.FileSystem == nil {
 		mr.FileSystem = &localFileSystem{}
 	}
+
 	if mr.Partitioner == nil {
-		mr.Partitioner = &hashPartitioner{4}
+		mr.Partitioner = &hashPartitioner{mr.NumberReducers}
+	}
+
+	if mr.OutputPath == "" {
+		panic("MapReduce: must specify output path")
 	}
 
 	err := os.MkdirAll(*tempDir, 0700)
@@ -84,8 +100,7 @@ func (mr *MapReduce) Run() error {
 }
 
 func (mr *MapReduce) startMaster(addr string) error {
-	log.Printf("starting master on %v\n", addr)
-
+	// This is really the standalone master
 	// create a single mapper and give it the splits
 	mapper := mapWorker{
 		mapper:      mr.Mapper,
@@ -118,14 +133,22 @@ func (mr *MapReduce) startMaster(addr string) error {
 	// each partition part is finished by a map task (shuffle phase) when loading
 	// onto the reducers local disks.
 	// For now we just need 1 reducer per partion to run
+	reduceWorkers := 0
 	for partition, paths := range partitions {
 		reducer := &reduceWorker{
-			fs:        mr.FileSystem,
-			partition: partition,
+			fs:           mr.FileSystem,
+			reducer:      mr.Reducer,
+			partition:    partition,
+			workerID:     reduceWorkers,
+			outputFormat: mr.OutputFormat,
+			outputPath:   path.Join(mr.OutputPath, fmt.Sprintf("part-%d-of-%d", reduceWorkers, mr.NumberReducers)),
 		}
+
+		reduceWorkers++
 
 		for _, path := range paths {
 			if err := reducer.loadData(path); err != nil {
+				log.Println(err)
 				// THis error could indicate that the mapper failed, that the data
 				// could not fit into memory or various other things.
 				// TODO: Properly handle all cases for this error
@@ -134,6 +157,7 @@ func (mr *MapReduce) startMaster(addr string) error {
 		}
 
 		if err := reducer.Run(); err != nil {
+			log.Println(err)
 			return fmt.Errorf("reduce failed for partition %q: %v\n", partition, err)
 		}
 	}
