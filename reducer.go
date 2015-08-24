@@ -1,4 +1,4 @@
-package mapreduce
+package MapReduce
 
 import (
 	"bufio"
@@ -179,6 +179,7 @@ func (rw *reduceWorker) sortAndLoad() (io.ReadCloser, error) {
 	bw := bufio.NewWriter(f)
 	enc := gob.NewEncoder(bw)
 
+	count := 0
 	for h.Len() > 0 {
 		lr := h.Pop().(*lazyReader)
 		if lr.kv == nil {
@@ -186,6 +187,7 @@ func (rw *reduceWorker) sortAndLoad() (io.ReadCloser, error) {
 			panic("reader had nil kv")
 		}
 
+		count++
 		if err := enc.Encode(lr.kv); err != nil {
 			return nil, err
 		}
@@ -199,6 +201,7 @@ func (rw *reduceWorker) sortAndLoad() (io.ReadCloser, error) {
 			lr.Close()
 		}
 	}
+	log.Printf("reduce shuffle records = %d\n", count)
 
 	if err := bw.Flush(); err != nil {
 		log.Println(err)
@@ -233,7 +236,9 @@ func (rw *reduceWorker) Run() (err error) {
 	// TODO: have this controlled by the FileSystem
 	bw := bufio.NewWriter(output)
 
-	if err = rw.runReduce(output, f); err != nil {
+	recordWriter := rw.outputFormat.RecordWriter(output)
+
+	if err = rw.runReduce(recordWriter, f); err != nil {
 		return
 	}
 
@@ -244,65 +249,88 @@ func (rw *reduceWorker) Run() (err error) {
 	return nil
 }
 
-func (rw *reduceWorker) runReduce(output io.Writer, input io.Reader) error {
+func (rw *reduceWorker) runReduce(recordWriter RecordWriter, input io.Reader) error {
 
-	last := &mapResult{}
 	kv := &mapResult{}
 
-	recordWriter := rw.outputFormat.RecordWriter(output)
-
 	dec := gob.NewDecoder(bufio.NewReader(input))
-	for {
-		err := dec.Decode(kv)
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-
-			return err
+	err := dec.Decode(kv)
+	if err != nil {
+		if err == io.EOF {
+			return io.ErrUnexpectedEOF
 		}
 
-		// TODO: do we need to copy this?
-		key := kv.K
+		return err
+	}
+
+	// TODO: do we need to copy this?
+	key := make([]byte, len(kv.K))
+	copy(key, kv.K)
+
+loop:
+	for {
+		// TODO: simplify this mess
 
 		ch := make(chan []byte, 3)
 		// TODO: avoid this copy
-		buf := make([]byte, len(kv.V))
-		copy(buf, kv.V)
-		ch <- buf
+
+		errors := make(chan error)
 
 		go func() {
 			defer close(ch)
-			// TODO: how to handle errors from iterating here?
 
-			*last = *kv
+			val := make([]byte, len(kv.V))
+			copy(val, kv.V)
+			ch <- val
 
-			for bytes.Equal(last.K, kv.K) {
-				err := dec.Decode(last)
+			for {
+				err := dec.Decode(kv)
 				if err != nil {
-					if err == io.EOF {
-						break
-					}
+					errors <- err
+					return
+				}
 
-					log.Println(err)
+				if !bytes.Equal(kv.K, key) {
+					// next key not equal, stored in kv
 					return
 				}
 
 				// TODO: avoid this copy
-				buf := make([]byte, len(last.V))
-				copy(buf, last.V)
+				// key is equal
+				val := make([]byte, len(kv.V))
+				copy(val, kv.V)
 
-				ch <- buf
+				ch <- val
 			}
-
-			*kv = *last
 		}()
 
-		res := rw.reducer.Reduce(key, ch)
+		resCh := make(chan []byte)
 
-		if err := recordWriter.WriteRecord(key, res); err != nil {
-			return err
+		go func() {
+			select {
+			case resCh <- rw.reducer.Reduce(key, ch):
+			default:
+			}
+		}()
+
+		select {
+		case err = <-errors:
+			if err != io.EOF {
+				return err
+			}
+
+			if err := recordWriter.WriteRecord(key, <-resCh); err != nil {
+				return err
+			}
+			break loop
+		case res := <-resCh:
+			if err := recordWriter.WriteRecord(key, res); err != nil {
+				return err
+			}
 		}
+
+		key = make([]byte, len(kv.K))
+		copy(key, kv.K)
 	}
 
 	return nil
