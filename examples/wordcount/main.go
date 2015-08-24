@@ -7,7 +7,7 @@ import (
 	"log"
 	"strings"
 
-	"github.com/zariel/mapreduce"
+	"github.com/zariel/MapReduce"
 )
 
 func init() {
@@ -16,7 +16,7 @@ func init() {
 
 type stringCountOF struct{}
 
-func (*stringCountOF) RecordWriter(w io.Writer) mapreduce.RecordWriter {
+func (*stringCountOF) RecordWriter(w io.Writer) MapReduce.RecordWriter {
 	return &stringCountW{w}
 }
 
@@ -25,13 +25,13 @@ type stringCountW struct {
 }
 
 func (sc *stringCountW) WriteRecord(k, v []byte) error {
-	_, err := fmt.Fprintf(sc.w, "%s,%d\n", k, binary.BigEndian.Uint64(v))
+	_, err := fmt.Fprintf(sc.w, "%s %d\n", string(k), binary.BigEndian.Uint64(v))
 	return err
 }
 
 type wordCount struct{}
 
-func (*wordCount) Map(output mapreduce.MapOutputCollector, key, value []byte) error {
+func (*wordCount) Map(output MapReduce.MapOutputCollector, key, value []byte) error {
 	line := string(value)
 	// int64 YOLO
 	buf := make([]byte, 8)
@@ -59,7 +59,7 @@ func (*wordCount) Reduce(key []byte, values <-chan []byte) []byte {
 
 func main() {
 	wc := &wordCount{}
-	mr := mapreduce.New(wc, wc, "testdata/data.txt")
+	mr := MapReduce.New(wc, wc, "testdata/data.txt")
 	mr.OutputFormat = &stringCountOF{}
 	mr.OutputPath = "out/"
 

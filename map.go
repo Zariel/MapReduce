@@ -1,4 +1,4 @@
-package mapreduce
+package MapReduce
 
 type MapOutputCollector interface {
 	Emit(key, value []byte) error

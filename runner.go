@@ -1,4 +1,4 @@
-package mapreduce
+package MapReduce
 
 import (
 	"flag"
@@ -21,7 +21,6 @@ func init() {
 }
 
 var (
-	binpath    = flag.String("mapreduce.bin", "", "the `file` to execute to run MapReduce tasks")
 	master     = flag.String("mapreduce.master", "", "the `address` of the MapReduce master task")
 	addr       = flag.String("mapreduce.addr", "", "local `address` to listen on")
 	taskMode   = flag.String("mapreduce.task_mode", "", "task mode to run as, master, map or reduce")
