@@ -307,10 +307,7 @@ loop:
 		resCh := make(chan []byte)
 
 		go func() {
-			select {
-			case resCh <- rw.reducer.Reduce(key, ch):
-			default:
-			}
+			resCh <- rw.reducer.Reduce(key, ch)
 		}()
 
 		select {
